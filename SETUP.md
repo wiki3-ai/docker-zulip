@@ -155,6 +155,12 @@ docker compose up -d --force-recreate zulip
 docker compose down && docker compose up -d
 ```
 
+> **Important:** `docker compose restart zulip` only restarts the process inside the
+> existing container — it does **NOT** pick up environment variable changes from
+> `compose.override.yaml`. Always use `docker compose up -d --force-recreate zulip`
+> when you change environment variables, then run `zulip-puppet-apply` if the change
+> affects `zulip.conf` settings (e.g. `CONFIG_*` variables).
+
 ### Health Checks
 
 ```bash
@@ -416,11 +422,25 @@ services:
       CONFIG_http_proxy__allow_ranges: "172.17.0.0/16"
 ```
 
-Then restart and apply the Smokescreen config change:
+Then **recreate** the container (not just restart) and apply the Smokescreen config:
 
 ```bash
+# 1. Recreate the container so it picks up the new env var
+#    "docker compose restart" does NOT pick up env var changes!
 docker compose up -d --force-recreate zulip
+
+# 2. Wait for the container to be ready
+sleep 10
+
+# 3. Apply the Smokescreen config change (answer 'y' when prompted)
 docker compose exec zulip /home/zulip/deployments/current/scripts/zulip-puppet-apply
+
+# 4. Verify the config took effect
+docker compose exec zulip grep -A2 http_proxy /etc/zulip/zulip.conf
+# Should show: allow_ranges = 172.17.0.0/16
+
+# 5. Verify Ollama is reachable from the container
+docker compose exec zulip curl -s http://host.docker.internal:11434/api/tags | head -1
 ```
 
 **Docs:** [Customizing the outgoing HTTP proxy](https://zulip.readthedocs.io/en/latest/production/deployment.html#customizing-the-outgoing-http-proxy)
