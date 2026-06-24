@@ -393,6 +393,39 @@ Then: `docker compose up -d --force-recreate zulip`
 - Generate a fresh App Password at [myaccount.google.com](https://myaccount.google.com)
 - Test with the Python snippet in the Health Checks section above
 
+### Topic Summarize / AI features fail ("Egress proxying is denied")
+
+Zulip routes **all outgoing HTTP through Smokescreen**, an SSRF proxy that blocks
+private IP addresses by default. If your LLM backend (Ollama, local OpenAI-compatible
+server, etc.) runs on the Docker host or in another container, Smokescreen will block it:
+
+```
+Egress proxying is denied to host 'host.docker.internal:11434':
+  no valid IP found among resolved addresses -
+  172.17.0.1 denied by rule 'Deny: Private Range'.
+```
+
+**Fix:** Add `CONFIG_http_proxy__allow_ranges` to the Zulip container environment
+in `compose.override.yaml`:
+
+```yaml
+services:
+  zulip:
+    environment:
+      # Allow Smokescreen to reach services on the Docker host
+      CONFIG_http_proxy__allow_ranges: "172.17.0.0/16"
+```
+
+Then restart and apply the Smokescreen config change:
+
+```bash
+docker compose up -d --force-recreate zulip
+docker compose exec zulip /home/zulip/deployments/current/scripts/zulip-puppet-apply
+```
+
+**Docs:** [Customizing the outgoing HTTP proxy](https://zulip.readthedocs.io/en/latest/production/deployment.html#customizing-the-outgoing-http-proxy)
+and [`[http_proxy]` system configuration](https://zulip.readthedocs.io/en/latest/production/system-configuration.html#http-proxy).
+
 ### Cloudflare tunnel not connecting
 
 ```bash
