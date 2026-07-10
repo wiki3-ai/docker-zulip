@@ -1,0 +1,37 @@
+---
+services:
+  hermes:
+    build:
+      context: /media/nvm4t2/Projects/hermes-agent
+      dockerfile: Dockerfile
+    image: hermes-agent:zulip-test
+    container_name: hermes
+    restart: unless-stopped
+    command: gateway run
+    ports:
+      - "8642:8642"   # Gateway API (OpenAI-compatible)
+      - "9119:9119"   # Web dashboard
+    volumes:
+      - ~/.hermes:/opt/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - HERMES_DASHBOARD=1
+      - HERMES_DASHBOARD_BASIC_AUTH_USERNAME=jim
+      - HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=noisuf88
+      - HERMES_DASHBOARD_BASIC_AUTH_SECRET=b9fbd1fd66d59cb9f41c666c9a6d5c74ab85a7c1c1c83a87fea2fb43b22db0fb
+      - PUID=1000
+      - PGID=1000
+      - ZULIP_SITE_URL=http://zulip:80
+      - ZULIP_EXTERNAL_HOST=chat.wiki3.ai
+    depends_on:
+      - zulip
+      - database
+      - memcached
+      - rabbitmq
+      - redis
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+          cpus: "4"
