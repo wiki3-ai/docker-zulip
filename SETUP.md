@@ -22,18 +22,24 @@ cloudflared container ──► zulip container :80 (HTTP)
                   ▼           ▼           ▼           ▼
               database    memcached   rabbitmq      redis
            (PostgreSQL 14)
+
+Hermes agent (on same Docker network)
+  │
+  └──► connects to zulip:80 internally
+       sends Host: chat.wiki3.ai via patched zulip client
 ```
 
-### Containers (6 total)
+### Containers (7 total)
 
-| Service    | Image                                | Purpose                        |
-|------------|--------------------------------------|--------------------------------|
-| `zulip`    | `ghcr.io/zulip/zulip-server:12.0-1` | Zulip web app + workers        |
-| `database` | `zulip/zulip-postgresql:14`         | PostgreSQL database            |
-| `memcached`| `memcached:alpine`                   | Object cache                   |
-| `rabbitmq` | `rabbitmq:4.2`                       | Message queue for workers      |
-| `redis`    | `redis:alpine`                       | Caching, rate limiting         |
-| `cloudflared` | `cloudflare/cloudflared:latest`   | Cloudflare Tunnel connector    |
+| Service       | Image                                | Purpose                             |
+|---------------|--------------------------------------|-------------------------------------|
+| `zulip`       | `ghcr.io/zulip/zulip-server:12.0-1` | Zulip web app + workers             |
+| `database`    | `zulip/zulip-postgresql:14`         | PostgreSQL database                 |
+| `memcached`   | `memcached:alpine`                   | Object cache                        |
+| `rabbitmq`    | `rabbitmq:4.2`                       | Message queue for workers           |
+| `redis`       | `redis:alpine`                       | Caching, rate limiting              |
+| `cloudflared` | `cloudflare/cloudflared:latest`      | Cloudflare Tunnel connector         |
+| `hermes`      | `hermes-agent:zulip-test` (local)    | Hermes AI agent (Zulip gateway bot) |
 
 ### Docker Volumes
 
@@ -44,6 +50,16 @@ cloudflared container ──► zulip container :80 (HTTP)
 | `zulip-docker_rabbitmq`     | RabbitMQ data             |
 | `zulip-docker_redis`        | Redis data                |
 
+### Hermes Runtime Data
+
+| Path                    | Contents                     |
+|-------------------------|------------------------------|
+| `~/.hermes/config.yaml` | Hermes configuration         |
+| `~/.hermes/.env`        | API keys & Zulip credentials |
+| `~/.hermes/sessions/`   | Chat session DB (SQLite)     |
+| `~/.hermes/skills/`     | Loaded skills                |
+| `~/.hermes/logs/`       | Agent logs                   |
+
 ---
 
 ## Project Files
@@ -52,11 +68,34 @@ cloudflared container ──► zulip container :80 (HTTP)
 /media/nvm4t2/Projects/zulip-docker/
 ├── .env                        # Secrets & tokens (gitignored)
 ├── compose.yaml                # Base compose (from upstream repo)
-├── compose.override.yaml       # Our customizations (tracked in git)
+├── compose.override.yaml       # Zulip customizations (tracked in git)
+├── compose.hermes.yaml         # Hermes agent service (tracked in git)
 ├── manage.py                   # Wrapper for Zulip management commands
 ├── Dockerfile                  # For local builds (not used — we use prebuilt image)
 └── SETUP.md                    # ← This file
+
+/media/nvm4t2/Projects/hermes-agent/
+├── gateway/platforms/zulip.py  # Zulip gateway adapter (Host-header patched)
+└── Dockerfile                  # Used to build hermes-agent:zulip-test
+
+/home/jim/Projects/ownersclub-gateway/
+├── docker-compose.yml          # OwnersClub portal + Squid cache proxy
+├── squid/squid.conf            # Squid config (SSL bump + StoreID)
+├── squid/hf-store-id.py        # StoreID helper for HF/Xet cache dedup
+└── portal/                     # Caddy web portal files
 ```
+
+### Running the Full Stack
+
+```bash
+cd /media/nvm4t2/Projects/zulip-docker
+docker compose -f compose.yaml -f compose.override.yaml -f compose.hermes.yaml up -d
+```
+
+> The `compose.hermes.yaml` file adds the Hermes agent to the zulip-docker
+> stack. Both projects share the same Docker network so Hermes can reach
+> Zulip via internal DNS (`zulip:80`) with `Host: chat.wiki3.ai` injected
+> by the patched zulip client library.
 
 ---
 
@@ -136,23 +175,32 @@ openssl rand -hex 32   # for secret_key
 
 ### Start / Stop / Restart
 
+Because Hermes is in a separate compose file, always specify all three files:
+
 ```bash
 cd /media/nvm4t2/Projects/zulip-docker
+COMPOSE_FILES="-f compose.yaml -f compose.override.yaml -f compose.hermes.yaml"
 
 # Start everything
-docker compose up -d
+docker compose $COMPOSE_FILES up -d
 
 # Stop everything
-docker compose down
+docker compose $COMPOSE_FILES down
 
 # Restart only Zulip (after config changes)
-docker compose restart zulip
+docker compose $COMPOSE_FILES restart zulip
 
 # Restart Zulip picking up new .env values
-docker compose up -d --force-recreate zulip
+docker compose $COMPOSE_FILES up -d --force-recreate zulip
+
+# Restart only Hermes (after code/config changes)
+docker compose $COMPOSE_FILES up -d --force-recreate hermes
 
 # Restart everything
-docker compose down && docker compose up -d
+docker compose $COMPOSE_FILES down && docker compose $COMPOSE_FILES up -d
+
+# Quick restart shortcut (most common: rebuild Hermes + restart)
+docker compose $COMPOSE_FILES up -d --force-recreate hermes
 ```
 
 > **Important:** `docker compose restart zulip` only restarts the process inside the
@@ -160,6 +208,25 @@ docker compose down && docker compose up -d
 > `compose.override.yaml`. Always use `docker compose up -d --force-recreate zulip`
 > when you change environment variables, then run `zulip-puppet-apply` if the change
 > affects `zulip.conf` settings (e.g. `CONFIG_*` variables).
+
+### Rebuilding Hermes
+
+When the Hermes gateway adapter or any source code changes:
+
+```bash
+cd /media/nvm4t2/Projects/hermes-agent
+
+# Build a new image
+docker build -t hermes-agent:zulip-test -f Dockerfile .
+
+# Restart Hermes with the new image
+cd /media/nvm4t2/Projects/zulip-docker
+docker compose $COMPOSE_FILES up -d --force-recreate hermes
+
+# Verify Zulip connection
+docker logs hermes 2>&1 | grep -i zulip
+# Should see: ✓ zulip connected
+```
 
 ### Health Checks
 
@@ -276,74 +343,153 @@ sudo apt update && sudo apt upgrade docker-ce docker-ce-cli containerd.io
 
 ---
 
+---
+
 ## Backups
 
-### Database Backup
+Backups are stored on a secondary drive at `/media/wde26t1/Archives/`.
+
+### What Gets Backed Up
+
+| Source | What | Size (approx) | Why |
+|--------|------|---------------|-----|
+| Zulip PostgreSQL | `pg_dump -U zulip zulip` (SQL dump) | ~200 KB | Crash-consistent database restore |
+| Zulip volumes | `zulip-docker_zulip` (uploads, avatars) | ~12 MB | Lost if volume is deleted |
+| Zulip volumes | `zulip-docker_postgresql-14` (raw data dir) | ~16 MB | Redundant with SQL dump, raw restore option |
+| Zulip volumes | `zulip-docker_rabbitmq` | ~100 KB | Message queue state |
+| Zulip volumes | `zulip-docker_redis` | ~4 KB | Cache (regenerates) |
+| Hermes home | `~/.hermes/` (config, sessions, skills) | ~10 MB | Bot identity, chat history, learned skills |
+| Configs | `.env`, `compose.override.yaml`, `compose.hermes.yaml`, Hermes `config.yaml` | — | Environment snapshots |
+
+### Quick Backup (One-Liner)
+
+Run this any time after significant changes:
+
+```bash
+# Creates dated archive in /media/wde26t1/Archives/YYYY-MM-DD-zulip-hermes-backup/
+sudo -E bash -c '
+  D=/media/wde26t1/Archives/$(date +%F)-zulip-hermes-backup
+  mkdir -p "$D"
+  echo "=== Hermes data ==="
+  tar czf "$D/hermes-data.tar.gz" \
+    --exclude=skills --exclude=cache --exclude=audio_cache --exclude=.cache \
+    -C ~ .hermes/
+  echo "=== PostgreSQL dump ==="
+  docker exec zulip-docker-database-1 pg_dump -U zulip zulip | gzip > "$D/zulip-postgres.sql.gz"
+  echo "=== Volumes ==="
+  for vol in zulip-docker_zulip zulip-docker_postgresql-14 zulip-docker_rabbitmq zulip-docker_redis; do
+    name=${vol#zulip-docker_}
+    tar czf "$D/zulip-volume-${name}.tar.gz" -C "/var/lib/docker/volumes/${vol}/_data" .
+  done
+  echo "=== Configs ==="
+  cp /media/nvm4t2/Projects/zulip-docker/.env "$D/zulip-env.txt" 2>/dev/null
+  cp /media/nvm4t2/Projects/zulip-docker/compose.override.yaml "$D/"
+  cp /media/nvm4t2/Projects/zulip-docker/compose.hermes.yaml "$D/"
+  cp ~/.hermes/.env "$D/hermes-env.txt" 2>/dev/null
+  cp ~/.hermes/config.yaml "$D/hermes-config.yaml"
+  echo "=== Done: $(du -sh "$D" | cut -f1) ==="
+  ls -lh "$D"
+'
+```
+
+### Source Code Backups
+
+All four repos are backed up to `/media/wde26t1/` via `rsync`:
+
+```bash
+# Quick sync (run after committing changes)
+rsync -a --delete --exclude=.venv --exclude=.git --exclude=__pycache__ \
+  --exclude='*.pyc' --exclude=node_modules --exclude=.playwright \
+  /media/nvm4t2/Projects/hermes-agent/ /media/wde26t1/Projects/hermes-agent/
+
+rsync -a --delete --exclude=.git \
+  /media/nvm4t2/Projects/zulip-docker/ /media/wde26t1/Projects/zulip-docker/
+
+rsync -a --delete --exclude=.git \
+  /media/nvm4t2/Projects/hermes-docker/ /media/wde26t1/Projects/hermes-docker/
+
+rsync -a --delete --exclude=.git --exclude=squid/cache --exclude=squid/logs \
+  --exclude=squid/ssl_db \
+  /home/jim/Projects/ownersclub-gateway/ /media/wde26t1/Workspace/ownersclub-gateway/
+```
+
+---
+
+## Restore from Backup
+
+### Restore Database (from SQL dump)
 
 ```bash
 cd /media/nvm4t2/Projects/zulip-docker
+COMPOSE_FILES="-f compose.yaml -f compose.override.yaml -f compose.hermes.yaml"
 
-# Full PostgreSQL dump
-docker compose exec -T database pg_dumpall -U zulip > backup_$(date +%Y%m%d_%H%M%S).sql
+# Stop Zulip
+docker compose $COMPOSE_FILES stop zulip
 
-# Compressed
-docker compose exec -T database pg_dumpall -U zulip | gzip > backup_$(date +%Y%m%d_%H%M%S).sql.gz
+# Drop and recreate the database
+docker compose exec -T database psql -U zulip -c "DROP DATABASE IF EXISTS zulip;"
+docker compose exec -T database psql -U zulip -c "CREATE DATABASE zulip OWNER zulip;"
+
+# Restore from compressed dump
+zcat /media/wde26t1/Archives/2026-07-09-zulip-hermes-backup/zulip-postgres.sql.gz | \
+  docker compose exec -T database psql -U zulip
+
+# Restart Zulip
+docker compose $COMPOSE_FILES start zulip
 ```
 
-### Restore Database
+### Restore Zulip Uploaded Files (from volume tarball)
 
 ```bash
-# Stop Zulip first
-docker compose stop zulip
-
-# Restore
-cat backup_YYYYMMDD_HHMMSS.sql | docker compose exec -T database psql -U zulip
-
-# Restart
-docker compose start zulip
+# Restore the zulip volume
+docker run --rm -v zulip-docker_zulip:/target -v /media/wde26t1/Archives/2026-07-09-zulip-hermes-backup:/backup alpine \
+  sh -c "rm -rf /target/* && tar xzf /backup/zulip-volume-zulip.tar.gz -C /target"
 ```
 
-### Backup Uploaded Files
+### Full Disaster Recovery (from scratch on a new host)
 
 ```bash
-# Back up the Zulip data volume
-docker run --rm -v zulip-docker_zulip:/data -v $(pwd):/backup alpine \
-  tar czf /backup/zulip-files-$(date +%Y%m%d).tar.gz -C /data .
+# 1. Install Docker + Docker Compose
+# 2. Clone repos (or restore from /media/wde26t1 backup)
+git clone https://github.com/zulip/docker-zulip
+cd docker-zulip
+git checkout wiki3
+
+# 3. Restore configs
+cp /media/wde26t1/Archives/2026-07-09-zulip-hermes-backup/zulip-env.txt .env
+cp /media/wde26t1/Archives/2026-07-09-zulip-hermes-backup/zulip-compose-override.yaml compose.override.yaml
+cp /media/wde26t1/Archives/2026-07-09-zulip-hermes-backup/zulip-compose-hermes.yaml compose.hermes.yaml
+
+# 4. Create volumes and restore data
+docker volume create zulip-docker_zulip
+docker volume create zulip-docker_postgresql-14
+docker volume create zulip-docker_rabbitmq
+docker volume create zulip-docker_redis
+
+docker run --rm -v zulip-docker_zulip:/target -v /media/wde26t1/Archives/2026-07-09-zulip-hermes-backup:/backup alpine \
+  tar xzf /backup/zulip-volume-zulip.tar.gz -C /target
+docker run --rm -v zulip-docker_postgresql-14:/target -v /media/wde26t1/Archives/2026-07-09-zulip-hermes-backup:/backup alpine \
+  tar xzf /backup/zulip-volume-postgresql-14.tar.gz -C /target
+# Repeat for rabbitmq and redis
+
+# 5. Start the stack
+docker compose -f compose.yaml -f compose.override.yaml -f compose.hermes.yaml up -d
+
+# 6. Restore Hermes data
+tar xzf /media/wde26t1/Archives/2026-07-09-zulip-hermes-backup/hermes-data.tar.gz -C ~/
+
+# 7. Rebuild Hermes image (if source is also restored)
+cd /media/nvm4t2/Projects/hermes-agent
+docker build -t hermes-agent:zulip-test -f Dockerfile .
+
+# 8. Recreate Hermes with new image
+cd /media/nvm4t2/Projects/zulip-docker
+docker compose -f compose.yaml -f compose.override.yaml -f compose.hermes.yaml up -d --force-recreate hermes
 ```
 
-### Full Backup Script
-
-```bash
-#!/bin/bash
-# save as: /media/nvm4t2/Projects/zulip-docker/backup.sh
-set -e
-cd "$(dirname "$0")"
-BACKUP_DIR="backups/$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$BACKUP_DIR"
-
-echo "Backing up database..."
-docker compose exec -T database pg_dumpall -U zulip | gzip > "$BACKUP_DIR/database.sql.gz"
-
-echo "Backing up uploaded files..."
-docker run --rm -v zulip-docker_zulip:/data -v "$(pwd)/$BACKUP_DIR":/backup alpine \
-  tar czf /backup/files.tar.gz -C /data .
-
-echo "Backing up .env..."
-cp .env "$BACKUP_DIR/env.backup"
-
-echo "Backup complete: $BACKUP_DIR"
-ls -lh "$BACKUP_DIR"
-```
-
-Make it executable:
-```bash
-chmod +x /media/nvm4t2/Projects/zulip-docker/backup.sh
-```
-
-Run it:
-```bash
-cd /media/nvm4t2/Projects/zulip-docker && ./backup.sh
-```
+> **Prefer the SQL dump** over the raw PostgreSQL volume tarball. The SQL dump
+> is version-independent and will work across Zulip upgrades. The raw volume
+> tarball is a last resort if the SQL dump is unavailable.
 
 ---
 
@@ -491,20 +637,141 @@ docker compose exec database psql -U zulip -c "SELECT pg_database_size('zulip');
 
 ---
 
-## Security Notes
+## System Recovery
 
-- `.env` is in `.gitignore` — never commit it
-- Docker credentials stored in `~/.docker/config.json` (plain text) — consider installing `docker-credential-secretservice` to use GNOME Keyring
-- All passwords are randomly generated 48-character hex strings (except the Google App Password)
-- SSL is handled by Cloudflare at the edge; Zulip only sees HTTP
-- The `LOADBALANCER_IPS` setting trusts the entire Docker bridge subnet (`172.16.0.0/12`)
+When Docker Compose itself isn't responding or the stack is broken:
 
----
+### 1. Check Docker daemon
 
-## References
+```bash
+sudo systemctl status docker
+sudo journalctl -u docker --no-pager -n 50
 
-- [Zulip Docker documentation](https://zulip.readthedocs.io/projects/docker/en/latest/)
-- [Docker-zulip GitHub repo](https://github.com/zulip/docker-zulip)
-- [Zulip production settings](https://zulip.readthedocs.io/en/stable/production/settings.html)
-- [Cloudflare Tunnel docs](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
-- [Google App Passwords](https://support.google.com/accounts/answer/185833)
+# If Docker is dead:
+sudo systemctl restart docker
+```
+
+### 2. Force-kill stuck containers
+
+```bash
+# List all containers
+docker ps -a
+
+# Force remove stuck containers
+docker rm -f zulip-docker-zulip-1 zulip-docker-database-1 \
+  zulip-docker-memcached-1 zulip-docker-rabbitmq-1 \
+  zulip-docker-redis-1 zulip-docker-cloudflared-1 hermes
+
+# Prune dead resources
+docker container prune -f
+```
+
+### 3. Wipe and restart the compose stack
+
+```bash
+cd /media/nvm4t2/Projects/zulip-docker
+COMPOSE_FILES="-f compose.yaml -f compose.override.yaml -f compose.hermes.yaml"
+
+# Full teardown
+docker compose $COMPOSE_FILES down -v --remove-orphans 2>/dev/null
+
+# Recreate everything from scratch
+docker compose $COMPOSE_FILES up -d
+
+# Check Zulip initialisation (can take 5-10 min on first boot)
+docker compose logs -f zulip
+# Look for: "done getpeercred" + "zulip-puppet-apply completed successfully"
+```
+
+### 4. Database recovery (if PostgreSQL won't start)
+
+```bash
+# Check PostgreSQL logs
+docker compose logs database
+
+# If the data directory is corrupt, restore from backup:
+docker compose stop zulip
+docker compose rm -f database
+
+# Restore the volume from tarball (see Restore section above)
+# Then restart:
+docker compose $COMPOSE_FILES up -d
+```
+
+### 5. Hermes stuck / won't start
+
+```bash
+# Check Hermes logs
+docker logs hermes 2>&1 | tail -40
+
+# Common fix: wrong Zulip credentials or connection
+# Verify environment:
+docker exec hermes env | grep -i zulip
+# Expected:
+#   ZULIP_SITE_URL=http://zulip:80
+#   ZULIP_EXTERNAL_HOST=chat.wiki3.ai
+#   ZULIP_BOT_EMAIL=hermes-bot@chat.wiki3.ai
+#   ZULIP_API_KEY=<redacted>
+
+# Test connection manually:
+docker exec hermes python3 -c "
+import zulip, requests
+from requests.adapters import HTTPAdapter
+
+class _HostHeaderAdapter(HTTPAdapter):
+    def send(self, request, **kwargs):
+        request.headers['Host'] = 'chat.wiki3.ai'
+        return super().send(request, **kwargs)
+
+class _PatchedZulipClient(zulip.Client):
+    def ensure_session(self):
+        super().ensure_session()
+        if self.session:
+            adapter = _HostHeaderAdapter()
+            self.session.mount('http://', adapter)
+            self.session.mount('https://', adapter)
+
+c = _PatchedZulipClient(site='http://zulip:80',
+    email='hermes-bot@chat.wiki3.ai',
+    api_key='$(docker exec hermes env | grep ZULIP_API_KEY | cut -d= -f2)')
+r = c.get_profile()
+print('OK' if r.get('result') == 'success' else r)
+"
+
+# If that fails, check if Zulip is reachable at all:
+docker exec hermes curl -s -H 'Host: chat.wiki3.ai' http://zulip:80/api/v1/server_settings | head -5
+```
+
+### 6. OwnersClub Gateway / Squid recovery
+
+```bash
+# The Squid proxy runs independently from the zulip-docker stack.
+cd /home/jim/Projects/ownersclub-gateway
+
+# Restart
+docker compose restart squid
+
+# Full rebuild + restart
+docker compose up -d --force-recreate squid
+
+# Check logs
+docker logs ownersclub-squid --tail 30
+
+# Test proxy
+curl -x http://localhost:3128 -sk -o /dev/null -w "%{http_code}" --max-time 10 https://huggingface.co/
+```
+
+### 7. Emergency access without Docker
+
+If Docker itself is broken and you need to access the PostgreSQL data directly:
+
+```bash
+# PostgreSQL data is at:
+sudo ls /var/lib/docker/volumes/zulip-docker_postgresql-14/_data/
+
+# You can install PostgreSQL directly and point it at this directory:
+sudo apt install postgresql-14
+sudo pg_ctlcluster 14 main start
+# But this is almost never needed — fixing Docker is easier.
+```
+````
