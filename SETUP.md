@@ -29,6 +29,10 @@ Hermes agent (on same Docker network)
        sends Host: chat.wiki3.ai via patched zulip client
 ```
 
+Zulip's AI features and Hermes both also call a local **Ollama** instance. That
+runs as a host systemd service, **not** as a container in this stack — see
+[Local LLM Backend (Ollama)](#local-llm-backend-ollama).
+
 ### Containers (7 total)
 
 | Service       | Image                                | Purpose                             |
@@ -139,6 +143,79 @@ To create a new App Password:
 | Email    | `jim@wiki3.ai`   |
 | Realm    | Wiki3            |
 | URL      | `https://chat.wiki3.ai` |
+
+### Local LLM Backend (Ollama)
+
+Zulip's AI features (topic summarization) and the Hermes agent both call a local
+Ollama instance. Ollama is **not** part of this compose stack — it runs as a host
+systemd service and containers reach it via `host.docker.internal`.
+
+| Item           | Value                                                 |
+|----------------|-------------------------------------------------------|
+| Service        | `ollama.service` (system user `ollama`, enabled)      |
+| Listen address | `0.0.0.0:11434` (`OLLAMA_HOST`)                       |
+| Unit override  | `/etc/systemd/system/ollama.service.d/override.conf`  |
+| Model          | `qwen3.6:35b-a3b` (Q4_K_M, ~26 GB)                    |
+| GPU            | RTX 4060 Ti, **8 GB VRAM**                            |
+
+Who calls it:
+
+| Consumer | Where it is configured                                                   |
+|----------|--------------------------------------------------------------------------|
+| Zulip    | `compose.override.yaml` → `TOPIC_SUMMARIZATION_MODEL` / `..._PARAMETERS` |
+| Hermes   | `~/.hermes/config.yaml` → `custom_providers` / `ollama_num_ctx`          |
+
+#### GPU configuration
+
+The card has 8 GB of VRAM but the model is ~26 GB, so it runs as a **partial
+offload**: as many layers as fit go on the GPU, the remainder stays on the CPU.
+This only works when the NVIDIA kernel modules are loaded for the *running*
+kernel — see [Ollama runs on CPU](#ollama-runs-on-cpu--nvidia-smi-fails) if they
+are not.
+
+Recommended `/etc/systemd/system/ollama.service.d/override.conf`:
+
+```ini
+[Service]
+Environment="OLLAMA_HOST=0.0.0.0:11434"
+# Model is ~26 GB on an 8 GB card. One slot keeps the whole
+# per-slot KV cache inside the VRAM budget.
+Environment="OLLAMA_NUM_PARALLEL=1"
+Environment="OLLAMA_MAX_LOADED_MODELS=1"
+# KV cache quantization (below) requires flash attention.
+Environment="OLLAMA_FLASH_ATTENTION=1"
+Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
+# 100k context needs ~9 GB of KV cache per slot at f16, which cannot fit.
+Environment="OLLAMA_CONTEXT_LENGTH=32768"
+```
+
+Apply it with:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart ollama
+```
+
+> **Keep `ollama_num_ctx` in `~/.hermes/config.yaml` in sync** with
+> `OLLAMA_CONTEXT_LENGTH`. It is currently `100000`, which overrides Ollama's
+> default and would request a KV cache far larger than the card can hold.
+
+#### Verifying the GPU is in use
+
+```bash
+# 1. The driver can see the card
+nvidia-smi
+
+# 2. Ollama detected a GPU - want library=CUDA,
+#    NOT: library=cpu ... total_vram="0 B"
+journalctl -u ollama --no-pager | grep "inference compute" | tail -1
+
+# 3. The loaded model is resident on the GPU - want size_vram > 0
+curl -s http://localhost:11434/api/ps | grep -o '"size_vram":[0-9]*'
+
+# 4. Generation throughput
+journalctl -u ollama -f | grep print_timing
+```
 
 ---
 
@@ -544,6 +621,105 @@ Then: `docker compose up -d --force-recreate zulip`
 - Use the **primary account email** (`ai@fovi.com`) not an alias (`ai@wiki3.ai`)
 - Generate a fresh App Password at [myaccount.google.com](https://myaccount.google.com)
 - Test with the Python snippet in the Health Checks section above
+
+### Ollama runs on CPU / `nvidia-smi` fails
+
+`nvidia-smi` failing with *"couldn't communicate with the NVIDIA driver"* means no
+NVIDIA kernel module is loaded. Ollama then falls back to CPU **silently** — it still
+works, just ~20x slower, and nothing in the Zulip UI reports a problem. Tell-tale
+signs in `journalctl -u ollama`:
+
+```
+msg="inference compute" id=cpu library=cpu ... total_vram="0 B"
+```
+
+The cause is a **kernel upgrade whose driver modules were never installed**. Ubuntu
+builds `linux-modules-nvidia-<driver>-<kernel>` per kernel version, and each one
+pins `nvidia-kernel-common-<driver>` to an **exact** version:
+
+```
+Depends: nvidia-kernel-common-595 (>= 595.84), nvidia-kernel-common-595 (<= 595.84-1)
+```
+
+Because that pin is exact, a module package becomes uninstallable as soon as Ubuntu
+supersedes the driver in the archive. On this host:
+
+| Module package                                   | Pins driver | Archive offers           |
+|--------------------------------------------------|-------------|--------------------------|
+| `linux-modules-nvidia-595-open-7.0.0-28-generic` | `595.84-1`  | `595.71.05`, `595.91.07` |
+| `linux-modules-nvidia-595-open-7.0.0-34-generic` | `595.91.07` | `595.91.07`              |
+
+So installing modules for the kernel you are *already running* cannot work, and fails
+like this:
+
+```
+linux-modules-nvidia-595-open-7.0.0-28-generic : Depends: nvidia-kernel-common-595
+  (>= 595.84) but 595.71.05-0ubuntu0.24.04.1 is to be installed
+```
+
+**Diagnose:**
+
+```bash
+uname -r                                     # the kernel you are booted into
+modinfo nvidia | head -3                     # "Module nvidia not found" == broken
+ls /dev/nvidia*                              # should exist; "No such file" == broken
+dpkg -l 'linux-modules-nvidia-*' | grep ^ii  # which kernels have modules built?
+```
+
+**Fix:** the only self-consistent version set is the **current kernel together with
+the current driver**. Let apt move both at once, then reboot:
+
+```bash
+sudo apt update
+sudo apt full-upgrade     # driver + new kernel + its matching signed modules
+sudo reboot
+```
+
+`full-upgrade` (not `upgrade`) is required: moving to a new kernel means *adding*
+`linux-image-*` packages, which plain `upgrade` will never do. Inspect the plan first:
+
+```bash
+apt-get -s full-upgrade | grep -E "^(Inst|Remv)" | grep -i nvidia
+```
+
+On this host that plan upgraded the driver stack to `595.91.07`, installed
+`linux-modules-nvidia-595-open-7.0.0-34-generic`, and removed the stale
+`linux-modules-nvidia-595-open-6.17.0-35-generic`.
+
+**Expect SSH to drop mid-upgrade.** `tailscale` is itself part of the upgrade, and
+restarting it tears down the connection. The `apt` transaction keeps running to
+completion in the background, so verify it rather than re-running it:
+
+```bash
+grep -E "^(Start-Date|End-Date)" /var/log/apt/history.log | tail -2  # matched pair = finished
+dpkg --audit                                                         # empty == clean state
+```
+
+If `sudo reboot` then reports *"Operation inhibited by APT"*, that inhibitor is
+usually a leftover process rather than a live transaction. Confirm no `apt`/`dpkg`
+process is running and no `APT` row appears in `systemd-inhibit --list`, then clear
+it:
+
+```bash
+sudo kill <pid-from-the-message>
+sudo reboot                      # or, if you have verified nothing is running: systemctl reboot -i
+```
+
+**After rebooting,** confirm the GPU is live before restarting Ollama:
+
+```bash
+uname -r                        # expect the new kernel
+nvidia-smi
+sudo systemctl restart ollama
+journalctl -u ollama --no-pager | grep "inference compute" | tail -1
+```
+
+> **Secure Boot is enabled on this host.** Stay on Ubuntu's prebuilt module packages
+> as above — they are signed by Canonical and load with no extra setup. Avoid DKMS
+> (`nvidia-dkms-*`), whose self-built modules Secure Boot rejects until you enrol a
+> Machine Owner Key via `mokutil --import` — an interactive process not worth the
+> risk on a remote host. Verify a plan is DKMS-free with
+> `apt-get -s full-upgrade | grep -i dkms`.
 
 ### Topic Summarize / AI features fail ("Egress proxying is denied")
 
