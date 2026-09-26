@@ -236,8 +236,8 @@ All secrets are defined in `.env` and loaded into Docker via `compose.override.y
 To regenerate all service passwords:
 ```bash
 cd /media/nvm4t2/Projects/zulip-docker
-# Back up first!
-cp .env .env.backup.$(date +%Y%m%d)
+# Back up first, outside the repo so a stray commit cannot pick it up
+cp .env "/media/wde26t1/Archives/env-backup.$(date +%Y%m%d)"
 
 # Generate new passwords (update individual lines in .env)
 openssl rand -hex 24   # for postgres, memcached, rabbitmq, redis

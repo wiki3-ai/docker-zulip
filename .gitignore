@@ -6,8 +6,10 @@
 .idea/
 *.tmproj
 
-# Secrets
+# Secrets. Match /.env.* as well, so the dated copies made by the
+# password-rotation steps (.env.backup.YYYYMMDD) cannot be committed.
 /.env
+/.env.*
 
 # Local configuration
 /compose.override.yaml
