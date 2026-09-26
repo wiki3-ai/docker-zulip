@@ -424,50 +424,96 @@ sudo apt update && sudo apt upgrade docker-ce docker-ce-cli containerd.io
 
 ## Backups
 
-Backups are stored on a secondary drive at `/media/wde26t1/Archives/`.
+Backups are stored on a secondary drive at `/media/wde26t1/Archives/`, written by
+the `backup-zulip-hermes` script in this repo and run daily by a systemd timer.
+
+A failed run leaves no directory behind, so the newest directory is always the last
+**successful** backup. Check either:
+
+```bash
+systemctl list-timers backup-zulip-hermes.timer
+ls -1d /media/wde26t1/Archives/*-zulip-hermes-backup | tail -3
+```
 
 ### What Gets Backed Up
 
-| Source | What | Size (approx) | Why |
-|--------|------|---------------|-----|
-| Zulip PostgreSQL | `pg_dump -U zulip zulip` (SQL dump) | ~200 KB | Crash-consistent database restore |
-| Zulip volumes | `zulip-docker_zulip` (uploads, avatars) | ~12 MB | Lost if volume is deleted |
-| Zulip volumes | `zulip-docker_postgresql-14` (raw data dir) | ~16 MB | Redundant with SQL dump, raw restore option |
-| Zulip volumes | `zulip-docker_rabbitmq` | ~100 KB | Message queue state |
-| Zulip volumes | `zulip-docker_redis` | ~4 KB | Cache (regenerates) |
-| Hermes home | `~/.hermes/` (config, sessions, skills) | ~10 MB | Bot identity, chat history, learned skills |
-| Configs | `.env`, `compose.override.yaml`, `compose.hermes.yaml`, Hermes `config.yaml` | — | Environment snapshots |
+Sizes are from a real run.
 
-### Quick Backup (One-Liner)
+| Source | What | Size | Why |
+|--------|------|------|-----|
+| Zulip PostgreSQL | `pg_dump -U zulip zulip` (SQL dump) | ~370 KB | Crash-consistent database restore |
+| Zulip volumes | `zulip-docker_zulip` (uploads, avatars) | ~14 MB | Lost if volume is deleted |
+| Zulip volumes | `zulip-docker_postgresql-14` (raw data dir) | ~17 MB | Redundant with SQL dump, raw restore option |
+| Zulip volumes | `zulip-docker_rabbitmq` | ~170 KB | Message queue state |
+| Zulip volumes | `zulip-docker_redis` | ~313 B | Cache (regenerates) |
+| Hermes home | `~/.hermes/` — config, sessions, **skills** | ~28 MB | Bot identity, chat history, learned skills |
+| Configs | `.env`, `compose.override.yaml`, `compose.hermes.yaml`, Hermes `.env` and `config.yaml` | ~18 KB | Environment snapshots |
 
-Run this any time after significant changes:
+About 58 MB per run.
+
+`~/.hermes/skills/` is included deliberately. It is learned local state, not a git
+checkout, so it cannot be re-fetched — an earlier version of this document excluded
+it, which silently dropped it from every backup.
+
+### Running a Backup
 
 ```bash
-# Creates dated archive in /media/wde26t1/Archives/YYYY-MM-DD-zulip-hermes-backup/
-sudo -E bash -c '
-  D=/media/wde26t1/Archives/$(date +%F)-zulip-hermes-backup
-  mkdir -p "$D"
-  echo "=== Hermes data ==="
-  tar czf "$D/hermes-data.tar.gz" \
-    --exclude=skills --exclude=cache --exclude=audio_cache --exclude=.cache \
-    -C ~ .hermes/
-  echo "=== PostgreSQL dump ==="
-  docker exec zulip-docker-database-1 pg_dump -U zulip zulip | gzip > "$D/zulip-postgres.sql.gz"
-  echo "=== Volumes ==="
-  for vol in zulip-docker_zulip zulip-docker_postgresql-14 zulip-docker_rabbitmq zulip-docker_redis; do
-    name=${vol#zulip-docker_}
-    tar czf "$D/zulip-volume-${name}.tar.gz" -C "/var/lib/docker/volumes/${vol}/_data" .
-  done
-  echo "=== Configs ==="
-  cp /media/nvm4t2/Projects/zulip-docker/.env "$D/zulip-env.txt" 2>/dev/null
-  cp /media/nvm4t2/Projects/zulip-docker/compose.override.yaml "$D/"
-  cp /media/nvm4t2/Projects/zulip-docker/compose.hermes.yaml "$D/"
-  cp ~/.hermes/.env "$D/hermes-env.txt" 2>/dev/null
-  cp ~/.hermes/config.yaml "$D/hermes-config.yaml"
-  echo "=== Done: $(du -sh "$D" | cut -f1) ==="
-  ls -lh "$D"
-'
+cd /media/nvm4t2/Projects/zulip-docker
+./backup-zulip-hermes
 ```
+
+Writes `/media/wde26t1/Archives/YYYY-MM-DD-zulip-hermes-backup/`. Safe to re-run:
+running it again on the same day replaces that day's directory. The directory only
+appears once every archive has been written and verified, so **a directory that
+exists is always a complete backup**. Nothing requires `sudo`, because the Docker
+daemon reads the root-owned volume data rather than the calling user.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `BACKUP_MOUNT` | `/media/wde26t1` | Mountpoint of the archive drive |
+| `BACKUP_DEVICE` | `/dev/sdc1` | Device that mountpoint must resolve to |
+| `BACKUP_ROOT` | `${BACKUP_MOUNT}/Archives` | Where dated directories are written |
+
+The script refuses to run unless the archive drive is mounted **and** resolves to
+`BACKUP_DEVICE`. Without that check, an unmounted drive would send all 58 MB into
+the root filesystem and still look like a successful backup.
+
+It also verifies every archive by decompressing it, requires the PostgreSQL dump to
+end with `PostgreSQL database dump complete`, and writes `SHA256SUMS` so bit-rot can
+be detected later:
+
+```bash
+cd /media/wde26t1/Archives/YYYY-MM-DD-zulip-hermes-backup && sha256sum -c SHA256SUMS
+```
+
+Everything is written mode `0600` inside a `0700` directory, because the archive
+holds credentials and a full database dump.
+
+### Automating the Backup (systemd timer)
+
+The unit files live in `systemd/`. Install them once:
+
+```bash
+cd /media/nvm4t2/Projects/zulip-docker
+sudo install -m 0644 systemd/backup-zulip-hermes.service \
+                      systemd/backup-zulip-hermes.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now backup-zulip-hermes.timer
+```
+
+It runs daily at 03:30 as `jim` (deliberately not 00:00, which already has
+dpkg-db-backup, logrotate and fstrim), with `Persistent=true` so a run missed while
+the machine was off happens at the next boot.
+
+To run it now and read the result:
+
+```bash
+sudo systemctl start backup-zulip-hermes.service
+journalctl -u backup-zulip-hermes.service -n 40
+```
+
+The service is `Type=oneshot` and exits non-zero if any part of the backup fails, so
+a bad run shows up in `systemctl --failed` rather than being silently skipped.
 
 ### Source Code Backups
 
@@ -494,6 +540,18 @@ rsync -a --delete --exclude=.git --exclude=squid/cache --exclude=squid/logs \
 
 ## Restore from Backup
 
+The examples below use `$BACKUP` for the backup directory. Set it to the one you are
+restoring from, and check the contents before you start — a directory only exists
+once the backup completed, but pick the right date deliberately rather than assuming
+the newest is the one you want:
+
+```bash
+BACKUP=$(ls -1d /media/wde26t1/Archives/*-zulip-hermes-backup | tail -1)
+echo "Restoring from: $BACKUP"
+ls -l "$BACKUP"
+sha256sum -c "$BACKUP/SHA256SUMS"   # verify the archives are intact first
+```
+
 ### Restore Database (from SQL dump)
 
 ```bash
@@ -508,7 +566,7 @@ docker compose exec -T database psql -U zulip -c "DROP DATABASE IF EXISTS zulip;
 docker compose exec -T database psql -U zulip -c "CREATE DATABASE zulip OWNER zulip;"
 
 # Restore from compressed dump
-zcat /media/wde26t1/Archives/2026-07-09-zulip-hermes-backup/zulip-postgres.sql.gz | \
+zcat "$BACKUP/zulip-postgres.sql.gz" | \
   docker compose exec -T database psql -U zulip
 
 # Restart Zulip
@@ -519,7 +577,7 @@ docker compose $COMPOSE_FILES start zulip
 
 ```bash
 # Restore the zulip volume
-docker run --rm -v zulip-docker_zulip:/target -v /media/wde26t1/Archives/2026-07-09-zulip-hermes-backup:/backup alpine \
+docker run --rm -v zulip-docker_zulip:/target -v "$BACKUP":/backup alpine \
   sh -c "rm -rf /target/* && tar xzf /backup/zulip-volume-zulip.tar.gz -C /target"
 ```
 
@@ -527,15 +585,15 @@ docker run --rm -v zulip-docker_zulip:/target -v /media/wde26t1/Archives/2026-07
 
 ```bash
 # 1. Install Docker + Docker Compose
-# 2. Clone repos (or restore from /media/wde26t1 backup)
-git clone https://github.com/zulip/docker-zulip
+# 2. Clone the fork (the wiki3 branch exists only on the fork, not upstream)
+git clone https://github.com/wiki3-ai/docker-zulip
 cd docker-zulip
 git checkout wiki3
 
 # 3. Restore configs
-cp /media/wde26t1/Archives/2026-07-09-zulip-hermes-backup/zulip-env.txt .env
-cp /media/wde26t1/Archives/2026-07-09-zulip-hermes-backup/zulip-compose-override.yaml compose.override.yaml
-cp /media/wde26t1/Archives/2026-07-09-zulip-hermes-backup/zulip-compose-hermes.yaml compose.hermes.yaml
+cp "$BACKUP/zulip-env.txt" .env
+cp "$BACKUP/zulip-compose-override.yaml" compose.override.yaml
+cp "$BACKUP/zulip-compose-hermes.yaml" compose.hermes.yaml
 
 # 4. Create volumes and restore data
 docker volume create zulip-docker_zulip
@@ -543,9 +601,9 @@ docker volume create zulip-docker_postgresql-14
 docker volume create zulip-docker_rabbitmq
 docker volume create zulip-docker_redis
 
-docker run --rm -v zulip-docker_zulip:/target -v /media/wde26t1/Archives/2026-07-09-zulip-hermes-backup:/backup alpine \
+docker run --rm -v zulip-docker_zulip:/target -v "$BACKUP":/backup alpine \
   tar xzf /backup/zulip-volume-zulip.tar.gz -C /target
-docker run --rm -v zulip-docker_postgresql-14:/target -v /media/wde26t1/Archives/2026-07-09-zulip-hermes-backup:/backup alpine \
+docker run --rm -v zulip-docker_postgresql-14:/target -v "$BACKUP":/backup alpine \
   tar xzf /backup/zulip-volume-postgresql-14.tar.gz -C /target
 # Repeat for rabbitmq and redis
 
@@ -553,7 +611,7 @@ docker run --rm -v zulip-docker_postgresql-14:/target -v /media/wde26t1/Archives
 docker compose -f compose.yaml -f compose.override.yaml -f compose.hermes.yaml up -d
 
 # 6. Restore Hermes data
-tar xzf /media/wde26t1/Archives/2026-07-09-zulip-hermes-backup/hermes-data.tar.gz -C ~/
+tar xzf "$BACKUP/hermes-data.tar.gz" -C ~/
 
 # 7. Rebuild Hermes image (if source is also restored)
 cd /media/nvm4t2/Projects/hermes-agent

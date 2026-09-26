@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+set -eux
+set -o pipefail
+
+# The archive holds credentials and a full database dump, so keep everything it
+# creates owner-only. ~/.hermes is already 0700 for the same reason.
+umask 0077
+
+# Back up the Zulip and Hermes service data to the external archive drive.
+#
+# Creates ${BACKUP_ROOT}/YYYY-MM-DD-zulip-hermes-backup/, using the filenames the
+# restore instructions in SETUP.md expect.
+#
+# Safe to re-run: re-running on the same day rebuilds that day's directory from
+# scratch. The directory only appears once every archive has been written and
+# verified, so a directory that exists is always a complete backup.
+#
+# Runs as the invoking user. No sudo is needed, because the Docker daemon (not
+# this user) reads the root-owned volume data: the postgresql-14, rabbitmq and
+# redis volume directories are not readable by the host user directly.
+
+BACKUP_MOUNT=${BACKUP_MOUNT:-/media/wde26t1}
+BACKUP_DEVICE=${BACKUP_DEVICE:-/dev/sdc1}
+BACKUP_ROOT=${BACKUP_ROOT:-${BACKUP_MOUNT}/Archives}
+readonly BACKUP_MOUNT BACKUP_DEVICE BACKUP_ROOT
+
+# The repo this script lives in, so it works from a clone at any path.
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly REPO_DIR
+readonly HERMES_DIR="${HOME}/.hermes"
+readonly TAR_IMAGE=alpine:latest
+readonly PROJECT=zulip-docker
+readonly DB_SERVICE=database
+readonly HERMES_CONTAINER=hermes
+readonly VOLUMES=(zulip postgresql-14 rabbitmq redis)
+readonly DUMP_MIN_BYTES=1024
+readonly MIN_FREE_KB=$((2 * 1024 * 1024))
+
+DATE_DIR="${BACKUP_ROOT}/$(date +%F)-zulip-hermes-backup"
+readonly DATE_DIR
+readonly STAGE_DIR="${DATE_DIR}.incomplete"
+
+# Never leave a partial backup behind that could be mistaken for a good one.
+trap 'rm -rf "${STAGE_DIR}"' EXIT
+
+# --- preflight -------------------------------------------------------------
+
+required_commands=(docker findmnt gzip install sha256sum tar zgrep)
+for command_name in "${required_commands[@]}"; do
+    if ! command -v "${command_name}" >/dev/null; then
+        echo "FATAL: required command '${command_name}' is not installed." >&2
+        exit 1
+    fi
+done
+
+# If the archive drive is not attached, writing to BACKUP_ROOT would silently
+# fill the root filesystem instead, and the backup would still look successful.
+if ! findmnt --mountpoint "${BACKUP_MOUNT}" >/dev/null; then
+    echo "FATAL: ${BACKUP_MOUNT} is not a mountpoint - is the archive drive attached?" >&2
+    exit 1
+fi
+
+mounted_device=$(findmnt -no SOURCE --mountpoint "${BACKUP_MOUNT}")
+if [ "${mounted_device}" != "${BACKUP_DEVICE}" ]; then
+    echo "FATAL: ${BACKUP_MOUNT} is on ${mounted_device}; expected ${BACKUP_DEVICE}." >&2
+    exit 1
+fi
+
+if ! docker image inspect "${TAR_IMAGE}" >/dev/null 2>&1; then
+    echo "FATAL: image '${TAR_IMAGE}' is not available locally; pull it first." >&2
+    exit 1
+fi
+
+# Resolve the database container through Compose labels rather than guessing at
+# the generated name, so this keeps working if the project is renamed.
+db_container=$(docker ps \
+    --filter "label=com.docker.compose.project=${PROJECT}" \
+    --filter "label=com.docker.compose.service=${DB_SERVICE}" \
+    --format '{{.Names}}')
+if [ -z "${db_container}" ]; then
+    echo "FATAL: no running '${DB_SERVICE}' container in project '${PROJECT}'." >&2
+    exit 1
+fi
+
+for container_name in "${db_container}" "${HERMES_CONTAINER}"; do
+    if [ "$(docker inspect -f '{{.State.Running}}' "${container_name}")" != "true" ]; then
+        echo "FATAL: container '${container_name}' is not running." >&2
+        exit 1
+    fi
+done
+
+required_files=(
+    "${REPO_DIR}/.env"
+    "${REPO_DIR}/compose.override.yaml"
+    "${REPO_DIR}/compose.hermes.yaml"
+    "${HERMES_DIR}/.env"
+    "${HERMES_DIR}/config.yaml"
+)
+for required_file in "${required_files[@]}"; do
+    if [ ! -f "${required_file}" ]; then
+        echo "FATAL: ${required_file} is missing." >&2
+        exit 1
+    fi
+done
+
+mkdir -p "${BACKUP_ROOT}"
+available_kb=$(df -Pk "${BACKUP_ROOT}" | awk 'NR==2 {print $4}')
+if [ "${available_kb}" -lt "${MIN_FREE_KB}" ]; then
+    echo "FATAL: only ${available_kb} KiB free on ${BACKUP_MOUNT}." >&2
+    exit 1
+fi
+
+# --- collect ---------------------------------------------------------------
+
+rm -rf "${STAGE_DIR}"
+mkdir -p "${STAGE_DIR}"
+
+# Logical PostgreSQL dump. With pipefail set, a failed pg_dump fails the script
+# instead of leaving a plausible-looking but empty file.
+docker exec "${db_container}" pg_dump -U zulip zulip | gzip > "${STAGE_DIR}/zulip-postgres.sql.gz"
+
+# pg_dump writes this line only after a successful, complete dump.
+if ! zgrep -q 'PostgreSQL database dump complete' "${STAGE_DIR}/zulip-postgres.sql.gz"; then
+    echo "FATAL: the PostgreSQL dump is incomplete." >&2
+    exit 1
+fi
+
+dump_bytes=$(stat -c %s "${STAGE_DIR}/zulip-postgres.sql.gz")
+if [ "${dump_bytes}" -lt "${DUMP_MIN_BYTES}" ]; then
+    echo "FATAL: PostgreSQL dump is implausibly small (${dump_bytes} bytes)." >&2
+    exit 1
+fi
+
+# Volume data. The throwaway container reads the volume as root, while the shell
+# redirect writes the tarball as the invoking user, so the archive stays
+# user-owned and readable without sudo.
+for volume_name in "${VOLUMES[@]}"; do
+    docker run --rm -v "${PROJECT}_${volume_name}:/data:ro" "${TAR_IMAGE}" \
+        tar czf - -C /data . > "${STAGE_DIR}/zulip-volume-${volume_name}.tar.gz"
+done
+
+# Hermes home. Caches are regenerated so they are skipped, but skills/ is kept:
+# it is learned local state rather than a git checkout, so it cannot be
+# re-fetched later.
+tar czf "${STAGE_DIR}/hermes-data.tar.gz" \
+    --exclude='.hermes/cache' \
+    --exclude='.hermes/.cache' \
+    --exclude='.hermes/audio_cache' \
+    --exclude='.hermes/models_dev_cache.json' \
+    -C "${HOME}" .hermes
+
+# Configs and secrets, using the filenames the restore steps expect. Everything
+# here carries a credential, so it is written 0600 rather than copied verbatim.
+install -m 0600 "${REPO_DIR}/.env" "${STAGE_DIR}/zulip-env.txt"
+install -m 0600 "${REPO_DIR}/compose.override.yaml" "${STAGE_DIR}/zulip-compose-override.yaml"
+install -m 0600 "${REPO_DIR}/compose.hermes.yaml" "${STAGE_DIR}/zulip-compose-hermes.yaml"
+install -m 0600 "${HERMES_DIR}/.env" "${STAGE_DIR}/hermes-env.txt"
+install -m 0600 "${HERMES_DIR}/config.yaml" "${STAGE_DIR}/hermes-config.yaml"
+
+# --- verify and publish ----------------------------------------------------
+
+# Read every archive back end-to-end. gzip -t catches truncation; the tar
+# listing catches damage that gzip alone would accept.
+for archive in "${STAGE_DIR}"/*.tar.gz; do
+    gzip -t "${archive}"
+    tar -tzf "${archive}" >/dev/null
+done
+
+# Checksums, so a later restore can confirm the archives have not rotted.
+(cd "${STAGE_DIR}" && sha256sum ./* > SHA256SUMS)
+
+rm -rf "${DATE_DIR}"
+mv "${STAGE_DIR}" "${DATE_DIR}"
+
+echo "Backup complete: ${DATE_DIR}"
+du -sh "${DATE_DIR}"
+ls -lh "${DATE_DIR}"

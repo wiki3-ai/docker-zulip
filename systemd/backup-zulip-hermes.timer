@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily backup of Zulip and Hermes service data
+
+[Timer]
+# 03:30 rather than 00:00, to avoid the midnight cluster of dpkg-db-backup,
+# logrotate and fstrim.
+OnCalendar=*-*-* 03:30:00
+# If the machine was off at 03:30, run as soon as it comes back.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

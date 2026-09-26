@@ -1,0 +1,20 @@
+[Unit]
+Description=Back up Zulip and Hermes service data to the archive drive
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+User=jim
+Group=jim
+# HOME locates ~/.hermes, which the script backs up. Never leave it to chance
+# in a system unit.
+Environment=HOME=/home/jim
+WorkingDirectory=/media/nvm4t2/Projects/zulip-docker
+ExecStart=/media/nvm4t2/Projects/zulip-docker/backup-zulip-hermes
+# Yield to Zulip rather than competing with it; the archive is only ~58 MB.
+IOSchedulingClass=idle
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
